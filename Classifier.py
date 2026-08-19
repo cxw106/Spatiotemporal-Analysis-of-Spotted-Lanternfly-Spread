@@ -5,9 +5,8 @@ from PIL import Image
 import open_clip
 import csv
 
-# =========================
+
 # 1. load
-# =========================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 model, _, preprocess_val = open_clip.create_model_and_transforms(
@@ -43,11 +42,10 @@ clf_model = BioCLIPClassifier(model, classifier).to(device)
 clf_model.eval()
 
 
-# =========================
+
 # 2. process image and create dataset
-# =========================
-IMAGE_DIR   = "your_images"   # 待修改
-OUTPUT_CSV  = "slf_occurrences.csv"
+IMAGE_DIR   = " "   # your image address
+OUTPUT_CSV  = " "    #SLF occurrence data
 CONFIDENCE_THRESHOLD = 0.8         # Confidence threshold
 
 results = []
@@ -91,9 +89,8 @@ for i, fname in enumerate(image_files):
     except Exception as e:
         print(f" jump: {fname}: {e}")
 
-# =========================
+
 # 3. 保存结果
-# =========================
 with open(OUTPUT_CSV, "w", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=["filename", "prediction", "confidence", "slf_prob"])
     writer.writeheader()
@@ -104,7 +101,7 @@ slf_count       = sum(1 for r in results if r["prediction"] == "SLF")
 not_slf_count   = sum(1 for r in results if r["prediction"] == "Not-SLF")
 uncertain_count = sum(1 for r in results if r["prediction"] == "Uncertain")
 
-print(f"\nComplete！")
+print(f"\nComplete")
 print(f"  SLF:      {slf_count} ")
 print(f"  Not-SLF:  {not_slf_count} ")
 print(f"  Uncertain:{uncertain_count} ")
