@@ -12,7 +12,11 @@ The project consists of two main components:
 
 ## SLF spread demo
 
-[SLF spread](slf_spread.mp4)
+
+
+https://github.com/user-attachments/assets/26d64f7f-527a-4052-aea4-0428d0ec58af
+
+
 
 ## Data Source
 
