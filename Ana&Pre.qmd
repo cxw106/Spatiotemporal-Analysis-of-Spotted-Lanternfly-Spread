@@ -1,0 +1,614 @@
+---
+title: "SLF Spatiotemporal Analysis"
+format: html
+---
+
+## 1. Read Data
+
+```{r}
+#| message: false
+#| warning: false
+#| cache: false
+library(INLA)
+library(sf)
+library(tidyverse)
+#install.packages("terra")  # Run once if terra is not installed.
+library(terra)
+
+analysis_years <- 2020:2026
+train_years <- 2020:2024
+test_years <- 2025:2026
+active_months <- 1:12
+end_year <- 2026
+end_month <- 7
+analysis_crs <- 26918
+cell_size_m <- 10000
+
+
+all_occurrence_file <- "all_occurence_clean.csv"
+roads_file <- "Highway.gpkg"
+ndvi_dir <- "NDVI"
+
+
+stopifnot(
+  file.exists(all_occurrence_file),
+  file.exists(roads_file),
+  dir.exists(ndvi_dir)
+)
+
+# Read the cleaned data once. The source file and its columns are not modified.
+df_all <- readr::read_csv(
+  all_occurrence_file,
+  col_select = c(year, month, decimalLatitude, decimalLongitude, species),
+  show_col_types = FALSE
+) %>%
+  filter(
+    year %in% analysis_years,
+    month %in% active_months,
+    year < end_year | (year == end_year & month <= end_month),
+    !is.na(decimalLatitude), !is.na(decimalLongitude)
+  )
+
+# Select spotted lanternfly records from the in-memory full dataset.
+df_slf <- df_all %>%
+  filter(species == "Lycorma delicatula")
+
+# Consecutive monthly index: January 2020 = 1, ..., July 2026 = 79.
+add_time_index <- function(x) {
+  x %>% mutate(
+    time_idx = (year - min(analysis_years)) * length(active_months) +
+      match(month, active_months)
+  )
+}
+df_slf <- add_time_index(df_slf)
+df_all <- add_time_index(df_all)
+n_times <- (end_year - min(analysis_years)) * length(active_months) + end_month
+
+slf_sf <- st_as_sf(df_slf, coords = c("decimalLongitude", "decimalLatitude"),
+                   crs = 4326, remove = FALSE) %>% st_transform(analysis_crs)
+all_sf <- st_as_sf(df_all, coords = c("decimalLongitude", "decimalLatitude"),
+                   crs = 4326, remove = FALSE) %>% st_transform(analysis_crs)
+roads_sf <- st_read(roads_file, quiet = TRUE) %>%
+  st_make_valid() %>% st_transform(analysis_crs)
+
+```
+
+## 2. Calculate
+
+```{r}
+# Use the full 2020-2026 observation footprint so train and test share a grid.
+ny_grid <- st_make_grid(all_sf, cellsize = cell_size_m, square = TRUE) %>%
+  st_as_sf() %>%
+  mutate(grid_id = row_number(), grid_area_km2 = as.numeric(st_area(.)) / 1e6)
+
+effort_grid_time <- all_sf %>%
+  st_join(ny_grid["grid_id"], left = FALSE) %>%
+  st_drop_geometry() %>% count(grid_id, time_idx, name = "effort")
+
+slf_grid_time <- slf_sf %>%
+  st_join(ny_grid["grid_id"], left = FALSE) %>%
+  st_drop_geometry() %>% count(grid_id, time_idx, name = "y")
+
+# Road density (km of road per km2) in each grid cell.
+roads_geometry <- st_sf(
+  geometry = st_geometry(roads_sf),
+  crs = st_crs(roads_sf)
+)
+
+roads_clipped <- suppressWarnings(st_intersection(
+  roads_geometry, ny_grid %>% select(grid_id)
+))
+road_cov <- roads_clipped %>%
+  mutate(road_km = as.numeric(st_length(st_geometry(.))) / 1000) %>%
+  st_drop_geometry() %>% group_by(grid_id) %>%
+  summarise(road_km = sum(road_km, na.rm = TRUE), .groups = "drop")
+
+# Monthly mean NDVI for each 10 km grid cell.
+ndvi_index <- tidyr::crossing(
+  year = analysis_years,
+  month = active_months
+) %>%
+  filter(year < end_year | (year == end_year & month <= end_month)) %>%
+  mutate(
+    time_idx = (year - min(analysis_years)) * length(active_months) + month,
+    file = file.path(
+      ndvi_dir,
+      sprintf("ndvi_%d_%02d.tif", year, month)
+    )
+  )
+
+missing_ndvi <- ndvi_index$file[!file.exists(ndvi_index$file)]
+if (length(missing_ndvi) > 0L) {
+  stop("Missing NDVI files: ", paste(missing_ndvi, collapse = ", "))
+}
+
+ndvi_grid_time <- purrr::map_dfr(seq_len(nrow(ndvi_index)), function(i) {
+  ndvi_raster <- terra::rast(ndvi_index$file[i])
+  grid_for_raster <- terra::project(
+    terra::vect(ny_grid),
+    terra::crs(ndvi_raster)
+  )
+  ndvi_values <- terra::extract(
+    ndvi_raster,
+    grid_for_raster,
+    fun = mean,
+    na.rm = TRUE
+  )
+
+  tibble(
+    grid_id = ny_grid$grid_id,
+    time_idx = ndvi_index$time_idx[i],
+    ndvi = ndvi_values[[2]]
+  )
+})
+
+# Fill NDVI gaps caused by cloud/snow masks or state-boundary pixels.
+interpolate_ndvi <- function(value, time) {
+  valid <- is.finite(value) & value > -999
+  if (sum(valid) < 2L) return(value)
+  approx(
+    x = time[valid],
+    y = value[valid],
+    xout = time,
+    method = "linear",
+    rule = 2
+  )$y
+}
+
+ndvi_grid_time <- ndvi_grid_time %>%
+  mutate(ndvi = if_else(is.finite(ndvi) & ndvi > -999, ndvi, NA_real_)) %>%
+  group_by(grid_id) %>%
+  arrange(time_idx, .by_group = TRUE) %>%
+  mutate(ndvi = interpolate_ndvi(ndvi, time_idx)) %>%
+  ungroup() %>%
+  group_by(time_idx) %>%
+  mutate(ndvi = replace_na(ndvi, median(ndvi, na.rm = TRUE))) %>%
+  ungroup()
+
+
+centre_coords <- st_coordinates(st_centroid(ny_grid))
+grid_attributes <- ny_grid %>%
+  st_drop_geometry() %>%
+  transmute(grid_id, grid_area_km2,
+            x = centre_coords[, 1], y_coord = centre_coords[, 2]) %>%
+  left_join(road_cov, by = "grid_id") %>%
+
+  mutate(
+    road_km = replace_na(road_km, 0),
+    road_density = road_km / grid_area_km2
+
+  ) %>%
+  select(grid_id, x, y_coord, road_density)
+
+
+model_df <- tidyr::crossing(
+  grid_id = ny_grid$grid_id,
+  time_idx = seq_len(n_times)
+) %>%
+  mutate(
+    year = analysis_years[(time_idx - 1L) %/% length(active_months) + 1L],
+    month = active_months[(time_idx - 1L) %% length(active_months) + 1L]
+  ) %>%
+  left_join(effort_grid_time, by = c("grid_id", "time_idx")) %>%
+  left_join(slf_grid_time, by = c("grid_id", "time_idx")) %>%
+  left_join(grid_attributes, by = "grid_id") %>%
+  left_join(ndvi_grid_time, by = c("grid_id", "time_idx")) %>%
+  mutate(effort = replace_na(effort, 0L), y = replace_na(y, 0L)) %>%
+  filter(effort > 0)
+
+if (anyNA(model_df$ndvi)) {
+  stop(
+    "NDVI remains missing for ", sum(is.na(model_df$ndvi)),
+    " model rows after temporal and spatial-median imputation."
+  )
+}
+
+# Standardize using training data only, preventing information leakage.
+train_rows <- model_df$year %in% train_years
+scale_from_train <- function(z, train) {
+  s <- sd(z[train], na.rm = TRUE)
+  if (!is.finite(s) || s == 0) stop("A predictor has zero training variance.")
+  (z - mean(z[train], na.rm = TRUE)) / s
+}
+model_df <- model_df %>% mutate(
+  road_z = scale_from_train(road_density, train_rows),
+  ndvi_z = scale_from_train(ndvi, train_rows),
+  year_idx = year - min(analysis_years) + 1L,
+  month_idx = month
+)
+
+cat("Training units:", sum(train_rows), "\n")
+cat("Test units:", sum(!train_rows), "\n")
+cat("Training zero proportion:", mean(model_df$y[train_rows] == 0), "\n")
+```
+
+## 3. Mesh and SPDE
+
+```{r}
+#| cache: false
+#| fig-cap: "INLA mesh"
+coords <- as.matrix(model_df[, c("x", "y_coord")])
+mesh <- inla.mesh.2d(
+  loc = coords, 
+  max.edge = c(15000, 50000),
+  cutoff = 8000, 
+  offset = c(15000, 40000))
+spde <- inla.spde2.pcmatern(
+  mesh = mesh, prior.range = c(50000, 0.5), prior.sigma = c(1, 0.01)
+)
+A <- inla.spde.make.A(mesh = mesh, loc = coords)
+spde_idx <- inla.spde.make.index("spatial.field", n.spde = mesh$n)
+plot(mesh); points(coords, col = "steelblue", pch = 20, cex = 0.25)
+```
+
+## 4. Train & Predict
+
+```{r}
+#| cache: true
+# Test responses are hidden from INLA and used only after prediction.
+y_stack <- model_df$y
+y_stack[!train_rows] <- NA_integer_
+
+stk <- inla.stack(
+  data = list(y = y_stack),
+  A = list(A, 1),
+  effects = list(
+    spde_idx,
+    data.frame(
+      intercept = 1,
+      year_idx = model_df$year_idx,
+      month_idx = model_df$month_idx,
+      road_z = model_df$road_z,
+      ndvi_z = model_df$ndvi_z
+    )
+  ),
+  tag = "all"
+)
+
+result <- inla(
+  y ~ -1 + intercept + road_z + ndvi_z +
+
+    f(year_idx, model = "rw1", constr = TRUE) +
+    f(month_idx, model = "rw2", cyclic = TRUE, constr = TRUE) +
+    f(spatial.field, model = spde),
+  family = "poisson",
+  data = inla.stack.data(stk),
+  E = model_df$effort,
+  control.predictor = list(A = inla.stack.A(stk), compute = TRUE,
+                           link = rep(1L, nrow(model_df))),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+  verbose = TRUE
+)
+saveRDS(result, "model_2020_2024_forecast_2025_2026.rds")
+summary(result)
+```
+
+## 5. Review
+
+```{r}
+#| cache: true
+# With `control.predictor$A`, INLA returns both:
+#   fitted.APredictor = values projected through inla.stack.A(stk), and
+#   fitted.Predictor  = the internal predictor/latent rows.
+# Only APredictor rows correspond one-to-one, and in order, with `model_df`.
+fitted_all <- result$summary.fitted.values
+
+if (is.null(fitted_all) || nrow(fitted_all) == 0L) {
+  stop(
+    "`result$summary.fitted.values` is empty. Re-run Section 4 with ",
+    "`control.predictor = list(..., compute = TRUE)` before Section 5."
+  )
+}
+
+apredictor_rows <- startsWith(
+  rownames(fitted_all),
+  "fitted.APredictor."
+)
+fitted_summary <- fitted_all[apredictor_rows, , drop = FALSE]
+
+if (nrow(fitted_summary) == 0L) {
+  stop(
+    "No fitted.APredictor rows were found in the INLA result. ",
+    "Check rownames(result$summary.fitted.values)."
+  )
+}
+
+if (nrow(fitted_summary) != nrow(model_df)) {
+  stop(
+    "Prediction-row mismatch: INLA returned ", nrow(fitted_summary),
+    " APredictor rows, but model_df contains ", nrow(model_df), " rows. ",
+    "Re-run Sections 2-4 in order so that model_df, stk, and result match."
+  )
+}
+
+# APredictor is the expected SLF rate per unit of observation effort.
+# Convert rates to expected SLF counts using the Poisson exposure.
+model_df$pred_rate <- fitted_summary$mean
+model_df$pred_rate_q025 <- fitted_summary$`0.025quant`
+model_df$pred_rate_q975 <- fitted_summary$`0.975quant`
+
+model_df$pred_mean <- model_df$pred_rate * model_df$effort
+model_df$pred_q025 <- model_df$pred_rate_q025 * model_df$effort
+model_df$pred_q975 <- model_df$pred_rate_q975 * model_df$effort
+
+test_predictions <- model_df %>%
+  filter(year %in% test_years) %>%
+  mutate(covered_95 = y >= pred_q025 & y <= pred_q975)
+
+test_metrics <- test_predictions %>%
+  group_by(year) %>%
+  summarise(
+    n = n(),
+    observed_positive_cells = n_distinct(grid_id[y > 0]),
+    observed_total = sum(y), predicted_total = sum(pred_mean),
+    MAE = mean(abs(y - pred_mean)),
+    RMSE = sqrt(mean((y - pred_mean)^2)),
+    poisson_deviance = 2 * mean(if_else(
+      y == 0, pred_mean, y * log(y / pred_mean) - (y - pred_mean)
+    )),
+    interval_coverage_95 = mean(covered_95), .groups = "drop"
+  )
+print(test_metrics)
+readr::write_csv(test_predictions, "predictions_2025_2026.csv")
+readr::write_csv(test_metrics, "test_metrics_2025_2026.csv")
+
+annual_compare <- test_predictions %>%
+  group_by(grid_id, year) %>%
+  summarise(observed = sum(y), predicted = sum(pred_mean), .groups = "drop") %>%
+  pivot_longer(c(observed, predicted), names_to = "type", values_to = "count") %>%
+  left_join(ny_grid %>% select(grid_id), by = "grid_id") %>% st_as_sf()
+
+p1<-ggplot(annual_compare) +
+  geom_sf(aes(fill = log1p(count)), color = NA) +
+  facet_grid(year ~ type) +
+  scale_fill_viridis_c(name = "log(1 + count)") +
+  theme_minimal() +
+  labs(title = "Observed and out-of-sample predicted SLF counts")
+
+p2<-ggplot(test_predictions, aes(y, pred_mean, color = factor(year))) +
+  geom_point(alpha = 0.35) + geom_abline(slope = 1, intercept = 0) +
+  scale_x_continuous(trans = "log1p") + scale_y_continuous(trans = "log1p") +
+  labs(x = "Observed", y = "Predicted", color = "Year") + theme_minimal()
+
+print(p1)
+print(p2)
+
+ggsave("map.png", plot = p1, width = 6, height = 4, dpi = 300)
+ggsave("point_chart.png", plot = p2, width = 6, height = 4, dpi = 300)
+```
+
+## 6 Cell-level
+
+```{r}
+#| cache: true
+# Aggregate monthly predictions to one record per 10 km grid cell and year.
+cell_year_predictions <- model_df %>%
+  group_by(grid_id, year) %>%
+  summarise(
+    observed_count = sum(y),
+    predicted_count = sum(pred_mean),
+    effort = sum(effort),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    observed_presence = observed_count > 0,
+    presence_prob = 1 - exp(-predicted_count)
+  )
+
+# Select the highest-precision threshold that retains at least 90% recall
+# using training years only. Test years are not used to choose the threshold.
+threshold_candidates <- seq(0, 1, by = 0.001)
+training_thresholds <- purrr::map_dfr(threshold_candidates, function(threshold) {
+  d <- cell_year_predictions %>% filter(year %in% train_years)
+  predicted <- d$presence_prob >= threshold
+  tp <- sum(predicted & d$observed_presence)
+  fp <- sum(predicted & !d$observed_presence)
+  fn <- sum(!predicted & d$observed_presence)
+  tibble(
+    threshold = threshold,
+    recall = ifelse(tp + fn > 0, tp / (tp + fn), NA_real_),
+    precision = ifelse(tp + fp > 0, tp / (tp + fp), NA_real_)
+  )
+})
+
+eligible_thresholds <- training_thresholds %>%
+  filter(recall >= 0.90, is.finite(precision))
+if (nrow(eligible_thresholds) == 0L) {
+  stop("No presence threshold achieved 90% training recall.")
+}
+presence_threshold <- eligible_thresholds %>%
+  arrange(desc(precision), desc(threshold)) %>%
+  slice(1) %>%
+  pull(threshold)
+cat("Presence threshold selected from training data:", presence_threshold, "\n")
+
+# Standardized inverse-frequency weights estimated from training cell-years.
+# Each observed class contributes 50% of the total evaluation weight.
+training_positive_rate <- cell_year_predictions %>%
+  filter(year %in% train_years) %>%
+  summarise(rate = mean(observed_presence)) %>%
+  pull(rate)
+
+weight_positive <- 1 / (2 * training_positive_rate)
+weight_negative <- 1 / (2 * (1 - training_positive_rate))
+cat(
+  "Training positive rate:", training_positive_rate,
+  "\nPositive weight:", weight_positive,
+  "\nNegative weight:", weight_negative, "\n"
+)
+
+test_cell_year <- cell_year_predictions %>%
+  filter(year %in% test_years) %>%
+  mutate(predicted_presence = presence_prob >= presence_threshold)
+
+# Confusion-matrix counts and imbalance-aware classification metrics.
+cell_confusion_metrics <- test_cell_year %>%
+  group_by(year) %>%
+  summarise(
+    TP = sum(predicted_presence & observed_presence),
+    FN = sum(!predicted_presence & observed_presence),
+    FP = sum(predicted_presence & !observed_presence),
+    TN = sum(!predicted_presence & !observed_presence),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    recall = TP / (TP + FN),
+    precision = TP / (TP + FP),
+    specificity = TN / (TN + FP),
+    accuracy = (TP + TN) / (TP + FN + FP + TN),
+    weighted_accuracy =
+      (weight_positive * TP + weight_negative * TN) /
+      (weight_positive * (TP + FN) + weight_negative * (TN + FP)),
+    balanced_accuracy = (recall + specificity) / 2,
+    F1 = 2 * precision * recall / (precision + recall),
+    F2 = 5 * precision * recall / (4 * precision + recall)
+  )
+print(cell_confusion_metrics)
+
+# Publication-ready confusion matrices showing annual cell counts.
+confusion_plot_data <- test_cell_year %>%
+  transmute(
+    year,
+    Observed = factor(
+      if_else(observed_presence, "Present", "Absent"),
+      levels = c("Present", "Absent")
+    ),
+    Predicted = factor(
+      if_else(predicted_presence, "Present", "Absent"),
+      levels = c("Absent", "Present")
+    )
+  ) %>%
+  count(year, Observed, Predicted, .drop = FALSE, name = "n") %>%
+  group_by(year) %>%
+  mutate(
+    label = format(n, big.mark = ","),
+    dark_cell = n >= 0.45 * max(n)
+  ) %>%
+  ungroup()
+
+confusion_matrix_plot <- ggplot(
+  confusion_plot_data,
+  aes(x = Observed, y = Predicted, fill = n)
+) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(
+    aes(label = label, color = dark_cell),
+    size = 4
+  ) +
+  facet_wrap(~year, nrow = 1) +
+  scale_fill_gradientn(
+    colours = c(
+      "#f7fbff", "#deebf7", "#c6dbef", "#9ecae1",
+      "#6baed6", "#3182bd", "#08519c", "#08306b"
+    ),
+    name = "Cell count",
+    labels = scales::label_comma()
+  ) +
+  scale_color_manual(values = c("TRUE" = "white", "FALSE" = "black"),
+                     guide = "none") +
+  coord_equal() +
+  labs(x = "Observed", y = "Predicted") +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.ticks = element_blank(),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.title = element_text(size = 10),
+    panel.spacing = grid::unit(1.5, "lines")
+  )
+
+print(confusion_matrix_plot)
+ggsave(
+  "confusion_matrix_2025_2026.tiff",
+  confusion_matrix_plot,
+  width = 7, height = 3.6, units = "in",
+  dpi = 600, compression = "lzw"
+)
+ggsave(
+  "confusion_matrix_2025_2026.png",
+  confusion_matrix_plot,
+  width = 7, height = 3.6, units = "in",
+  dpi = 600, bg = "white"
+)
+
+# Average precision (PR-AUC summary) calculated separately by test year.
+average_precision <- function(observed, probability) {
+  ord <- order(probability, decreasing = TRUE)
+  observed <- observed[ord]
+  if (sum(observed) == 0L) return(NA_real_)
+  precision_at_rank <- cumsum(observed) / seq_along(observed)
+  mean(precision_at_rank[observed])
+}
+cell_pr_auc <- test_cell_year %>%
+  group_by(year) %>%
+  summarise(
+    PR_AUC = average_precision(observed_presence, presence_prob),
+    .groups = "drop"
+  )
+print(cell_pr_auc)
+
+# Count accuracy only among cells where SLF was actually observed.
+positive_cell_errors <- test_cell_year %>%
+  filter(observed_presence) %>%
+  group_by(year) %>%
+  summarise(
+    positive_cells = n(),
+    MAE_positive = mean(abs(observed_count - predicted_count)),
+    RMSE_positive = sqrt(mean((observed_count - predicted_count)^2)),
+    mean_bias_positive = mean(predicted_count - observed_count),
+    .groups = "drop"
+  )
+print(positive_cell_errors)
+
+# Recall of the strongest 10% of observed-positive hotspots.
+hotspot_recall <- test_cell_year %>%
+  group_by(year) %>%
+  group_modify(~ {
+    positive <- .x %>% filter(observed_presence)
+    k <- max(1L, ceiling(0.10 * nrow(positive)))
+    observed_hotspots <- positive %>%
+      slice_max(observed_count, n = k, with_ties = FALSE) %>% pull(grid_id)
+    predicted_hotspots <- .x %>%
+      slice_max(predicted_count, n = k, with_ties = FALSE) %>% pull(grid_id)
+    tibble(
+      hotspot_cells = k,
+      top_10pct_hotspot_recall = mean(observed_hotspots %in% predicted_hotspots)
+    )
+  }) %>%
+  ungroup()
+print(hotspot_recall)
+
+# Cell-level bias map. Positive values indicate overprediction.
+cell_bias_map <- test_cell_year %>%
+  mutate(bias = predicted_count - observed_count) %>%
+  left_join(ny_grid %>% select(grid_id), by = "grid_id") %>%
+  st_as_sf()
+
+# Outer boundary of all grid cells included in the analysis.
+study_boundary <- ny_grid %>%
+  filter(grid_id %in% cell_year_predictions$grid_id) %>%
+  summarise()
+
+cell_bias<-ggplot(cell_bias_map) +
+  geom_sf(aes(fill = bias), color = "grey75", linewidth = 0.05) +
+  geom_sf(
+    data = study_boundary,
+    fill = NA, color = "black", linewidth = 0.45,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~year) +
+  scale_fill_gradient2(
+    low = "#2166ac", mid = "white", high = "#b2182b",
+    midpoint = 0, name = "Predicted - observed"
+  ) +
+  theme_minimal() +
+  labs(title = "Annual cell-level prediction bias")
+ggsave("cell_bias.png", plot = cell_bias, width = 6, height = 4, dpi = 300)
+
+readr::write_csv(test_cell_year, "cell_level_predictions_2025_2026.csv")
+readr::write_csv(cell_confusion_metrics, "cell_confusion_metrics_2025_2026.csv")
+readr::write_csv(confusion_plot_data, "confusion_matrix_counts_2025_2026.csv")
+readr::write_csv(positive_cell_errors, "positive_cell_errors_2025_2026.csv")
+readr::write_csv(hotspot_recall, "hotspot_recall_2025_2026.csv")
+```
+
